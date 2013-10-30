@@ -43,6 +43,8 @@ struct link_config_ctx {
 
         int ethtool_fd;
 
+        bool enable_name_policy;
+
         sd_rtnl *rtnl;
 
         char **link_dirs;
@@ -65,6 +67,8 @@ int link_config_ctx_new(link_config_ctx **ret) {
         LIST_HEAD_INIT(ctx->links);
 
         ctx->ethtool_fd = -1;
+
+        ctx->enable_name_policy = true;
 
         ctx->link_dirs = strv_new("/etc/systemd/network",
                                   "/run/systemd/network",
@@ -180,11 +184,36 @@ failure:
         return r;
 }
 
+static bool enable_name_policy(void) {
+        _cleanup_free_ char *line;
+        char *w, *state;
+        int r;
+        size_t l;
+
+        r = read_one_line_file("/proc/cmdline", &line);
+        if (r < 0) {
+                log_warning("Failed to read /proc/cmdline, ignoring: %s", strerror(-r));
+                return true; /* something is very wrong, let's not make it worse */
+        }
+
+        FOREACH_WORD_QUOTED(w, l, line, state)
+                if (strneq(w, "net.ifnames=0", l))
+                        return false;
+
+        return true;
+}
+
 int link_config_load(link_config_ctx *ctx) {
         int r;
         char **files, **f;
 
         link_configs_free(ctx);
+
+
+        if (!enable_name_policy()) {
+                ctx->enable_name_policy = false;
+                log_info("Network interface NamePolicy= disabled on kernel commandline, ignoring.");
+        }
 
         /* update timestamp */
         paths_check_timestamp(ctx->link_dirs, &ctx->link_dirs_ts_usec, true);
@@ -254,10 +283,8 @@ int link_config_get(link_config_ctx *ctx, struct udev_device *device, link_confi
         link_config *link;
 
         LIST_FOREACH(links, link, ctx->links) {
-                if (!match_config(link, device)) {
-                        log_info("Config file %s does not apply to device %s", link->filename, udev_device_get_sysname(device));
-                } else {
-                        log_info("Config file %s applies to device %s", link->filename, udev_device_get_sysname(device));
+                if (match_config(link, device)) {
+                        log_debug("Config file %s applies to device %s", link->filename, udev_device_get_sysname(device));
                         *ret = link;
                         return 0;
                 }
@@ -309,27 +336,6 @@ static int rtnl_set_properties(sd_rtnl *rtnl, int ifindex, const char *name, con
         }
 
         return 0;
-}
-
-static bool enable_name_policy(void) {
-        _cleanup_free_ char *line;
-        char *w, *state;
-        int r;
-        size_t l;
-
-        r = read_one_line_file("/proc/cmdline", &line);
-        if (r < 0) {
-                log_warning("Failed to read /proc/cmdline, ignoring: %s", strerror(-r));
-                return true; /* something is very wrong, let's not make it worse */
-        }
-
-        FOREACH_WORD_QUOTED(w, l, line, state)
-                if (strneq(w, "net.ifnames=0", l)) {
-                        log_info("Link name policy disabled on kernel commandline, ignoring.");
-                        return false;
-                }
-
-        return true;
 }
 
 static bool mac_is_random(struct udev_device *device) {
@@ -431,8 +437,6 @@ int link_config_apply(link_config_ctx *ctx, link_config *config, struct udev_dev
         if (!old_name)
                 return -EINVAL;
 
-        log_info("Configuring %s", old_name);
-
         if (config->description) {
                 r = udev_device_set_sysattr_value(device, "ifalias",
                                                   config->description);
@@ -457,7 +461,7 @@ int link_config_apply(link_config_ctx *ctx, link_config *config, struct udev_dev
                 return -ENODEV;
         }
 
-        if (config->name_policy && enable_name_policy()) {
+        if (ctx->enable_name_policy && config->name_policy) {
                 NamePolicy *policy;
 
                 for (policy = config->name_policy; !new_name && *policy != _NAMEPOLICY_INVALID; policy++) {
